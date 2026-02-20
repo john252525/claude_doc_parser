@@ -1,4 +1,5 @@
 import io
+import zipfile
 from urllib.parse import urlparse
 
 import httpx
@@ -53,7 +54,28 @@ EXTRACTORS = {
 }
 
 
-def guess_extension(url: str, content_type: str | None) -> str | None:
+def guess_from_magic(data: bytes) -> str | None:
+    """Detect file type by magic bytes."""
+    if data[:4] == b"%PDF":
+        return ".pdf"
+    # DOCX and XLSX are both ZIP archives — check internal structure
+    if data[:4] == b"PK\x03\x04":
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                names = zf.namelist()
+                if any(n.startswith("word/") for n in names):
+                    return ".docx"
+                if any(n.startswith("xl/") for n in names):
+                    return ".xlsx"
+        except zipfile.BadZipFile:
+            pass
+    # OLE2 compound document (legacy .xls, .doc)
+    if data[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+        return ".xls"
+    return None
+
+
+def guess_extension(url: str, content_type: str | None, data: bytes) -> str | None:
     # Try from URL path first
     parsed = urlparse(url)
     path = parsed.path.lower()
@@ -73,7 +95,8 @@ def guess_extension(url: str, content_type: str | None) -> str | None:
             if mime in content_type:
                 return ext
 
-    return None
+    # Last resort: detect by file content (magic bytes)
+    return guess_from_magic(data)
 
 
 @app.get("/extract")
@@ -97,7 +120,7 @@ async def extract_text(
         raise HTTPException(status_code=413, detail="Document too large (max 50 MB)")
 
     content_type = resp.headers.get("content-type", "")
-    ext = guess_extension(url, content_type)
+    ext = guess_extension(url, content_type, resp.content)
 
     if ext is None:
         raise HTTPException(
